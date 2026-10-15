@@ -1,6 +1,7 @@
 //! The viewer window: renders the remote canvas, forwards input and keeps
 //! the host's virtual display sized to the window.
 
+mod controls;
 pub mod dialog;
 mod keymap;
 mod reconnect;
@@ -18,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
@@ -97,9 +98,73 @@ struct App {
     /// even if modifiers changed in between.
     pressed: HashMap<KeyCode, u32>,
     cursors: HashMap<u32, CustomCursor>,
+    remote_cursor: Option<CursorShape>,
+    local_cursor: bool,
+    status: String,
+    ui_due: Option<Instant>,
 }
 
 impl App {
+    fn toggle_fullscreen(&mut self) {
+        self.release_all();
+        if let Some(w) = &self.window {
+            w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
+            w.request_redraw();
+        }
+    }
+
+    fn sync_cursor(&mut self, el: &ActiveEventLoop) {
+        let local = self.renderer.as_ref().is_some_and(|r| r.controls.local_pointer());
+        if local == self.local_cursor {
+            return;
+        }
+        self.local_cursor = local;
+        if local {
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(true);
+                w.set_cursor(CursorIcon::Default);
+            }
+        } else if let Some(c) = self.remote_cursor.clone() {
+            self.set_cursor(el, c);
+        }
+    }
+
+    fn apply_controls(&mut self, el: &ActiveEventLoop, actions: controls::Actions) {
+        if actions.fullscreen {
+            self.toggle_fullscreen();
+        }
+        if let Some(scale) = actions.render_scale {
+            self.cfg.op.lock().render_scale = scale;
+            self.send_resize();
+        }
+        if let Some(after_loss) = actions.after_loss {
+            self.cfg.op.lock().after_loss = after_loss;
+        }
+        if actions.disconnect {
+            self.release_all();
+            el.exit();
+        } else if actions.restart {
+            self.release_all();
+            if let Some(s) = self.session.take() {
+                s.shutdown();
+            }
+            self.retry_due = None;
+            self.cursors.clear();
+            self.remote_cursor = None;
+            self.scroll_accum = 0.0;
+            self.status = "Connecting…".into();
+            if let Some(w) = &self.window {
+                w.set_title(&format!("{} — connecting…", self.opts.title));
+                w.request_redraw();
+            }
+            if let Some(r) = &mut self.renderer {
+                r.set_dimmed(true);
+            }
+            // Explicit restart works even with --no-reconnect.
+            self.start_session();
+        }
+    }
+
     fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
         let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
         // Same logical size, fewer backing pixels: the Mac lays out as usual
@@ -239,6 +304,7 @@ impl App {
             }
             OnEnd::Retry(d) => d,
         };
+        self.status = format!("Reconnecting: {reason}");
         tracing::warn!("{reason}; reconnecting in {} s", delay.as_secs());
         // Joins the old threads so their sockets and UDP ports are released
         // before the next session binds them.
@@ -252,6 +318,7 @@ impl App {
         self.buttons = 0;
         self.scroll_accum = 0.0;
         self.cursors.clear();
+        self.remote_cursor = None;
         if let Some(w) = &self.window {
             w.set_cursor_visible(true);
             w.set_cursor(CursorIcon::Default);
@@ -261,6 +328,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_dimmed(true);
         }
+        self.sync_cursor(el);
     }
 
     fn fail(&mut self, el: &ActiveEventLoop, msg: String) {
@@ -308,6 +376,7 @@ impl ApplicationHandler<Tagged> for App {
                     tracing::info!("reconnected");
                 }
                 self.reconnector.connected();
+                self.status = "Connected".into();
                 if let Some(r) = &mut self.renderer {
                     r.set_dimmed(false);
                 }
@@ -331,7 +400,12 @@ impl ApplicationHandler<Tagged> for App {
                     r.set_canvas(width, height);
                 }
             }
-            Event::Cursor(c) => self.set_cursor(el, c),
+            Event::Cursor(c) => {
+                self.remote_cursor = Some(c.clone());
+                if !self.local_cursor {
+                    self.set_cursor(el, c);
+                }
+            },
             Event::Closed(reason) => {
                 self.error = reason;
                 el.exit();
@@ -344,6 +418,44 @@ impl ApplicationHandler<Tagged> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let WindowEvent::KeyboardInput { event: ref key, is_synthetic: false, .. } = event {
+            let open = self.renderer.as_ref().is_some_and(|r| r.controls.open);
+            if let PhysicalKey::Code(code) = key.physical_key
+                && let Some(shortcut) = controls::shortcut(code, self.modifiers, open)
+                && key.state == ElementState::Pressed
+            {
+                if !key.repeat {
+                    self.release_all();
+                    match shortcut {
+                        controls::Shortcut::Fullscreen => self.toggle_fullscreen(),
+                        controls::Shortcut::Menu => {
+                            if let Some(r) = &mut self.renderer {
+                                r.controls.open = !r.controls.open;
+                            }
+                        }
+                        controls::Shortcut::Close => {
+                            if let Some(r) = &mut self.renderer {
+                                r.controls.open = false;
+                            }
+                        }
+                    }
+                    self.sync_cursor(el);
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+                return;
+            }
+        }
+        let consumed = match (&mut self.renderer, &self.window) {
+            (Some(r), Some(w)) => r.controls.event(w, &event),
+            _ => false,
+        };
+        self.sync_cursor(el);
+        if consumed {
+            // A drag or shortcut started on the remote desktop must not
+            // leave buttons or modifiers held when entering local UI.
+            self.release_all();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
@@ -374,8 +486,21 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                if let Some(r) = &mut self.renderer {
-                    r.render();
+                let scale = self.opts.scale.unwrap_or_else(|| {
+                    if self.window.as_ref().is_some_and(|w| w.scale_factor() >= 1.5) { 2.0 } else { 1.0 }
+                });
+                let op = *self.cfg.op.lock();
+                let decoder = self.session.as_ref().map_or("", Session::decoder);
+                let decoder = if decoder.is_empty() { "Waiting for video" } else { decoder };
+                if let (Some(r), Some(w)) = (&mut self.renderer, &self.window) {
+                    let was_open = r.controls.open;
+                    let actions = r.render(w, op, &self.status, decoder, scale == 2.0);
+                    if !was_open && r.controls.open {
+                        self.release_all();
+                    }
+                    self.apply_controls(el, actions);
+                    self.sync_cursor(el);
+                    self.ui_due = self.renderer.as_ref().and_then(|r| r.controls.repaint_at);
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
@@ -420,22 +545,19 @@ impl ApplicationHandler<Tagged> for App {
                 tracing::info!("reconnecting");
                 self.start_session();
             }
-        let wake = match (self.resize_due, self.retry_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        match wake {
-            Some(due) if Instant::now() >= due => {
-                self.resize_due = None;
-                self.send_resize();
-                el.set_control_flow(match self.retry_due {
-                    Some(d) => ControlFlow::WaitUntil(d),
-                    None => ControlFlow::Wait,
-                });
-            }
-            Some(due) => el.set_control_flow(ControlFlow::WaitUntil(due)),
-            None => el.set_control_flow(ControlFlow::Wait),
+        if self.ui_due.is_some_and(|t| Instant::now() >= t) {
+            self.ui_due = None;
+            if let Some(w) = &self.window { w.request_redraw(); }
         }
+        if self.resize_due.is_some_and(|t| Instant::now() >= t) {
+            self.resize_due = None;
+            self.send_resize();
+        }
+        let wake = [self.resize_due, self.retry_due, self.ui_due].into_iter().flatten().min();
+        el.set_control_flow(match wake {
+            Some(due) => ControlFlow::WaitUntil(due),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
@@ -477,6 +599,10 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         modifiers: ModifiersState::empty(),
         pressed: HashMap::new(),
         cursors: HashMap::new(),
+        remote_cursor: None,
+        local_cursor: false,
+        status: "Connecting…".into(),
+        ui_due: None,
     };
     event_loop.run_app_on_demand(&mut app)?;
     if let Some(s) = app.session.take() {

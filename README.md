@@ -92,6 +92,18 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 | `--swap-ctrl-cmd` | Map `Ctrl` to `⌘`. By default, `Super` is `⌘` and `Alt` is `⌥`. |
 | `-v`, `-vv` | Enable debug or trace logging (passwords and clipboard contents are never logged). |
 
+## In-Session Controls
+
+Click **Controls** at the top of the viewer, or press **Ctrl+Alt+M**, to open the session panel. It shows connection status and the active decoder, and lets you:
+
+* Switch between full and half stream resolution (half requires a 2× backing scale).
+* Choose whether packet loss freezes the picture or keeps it moving with temporary artifacts.
+* Toggle fullscreen, restart the session, or disconnect.
+
+**Ctrl+Alt+Enter** toggles fullscreen at any time. **Esc** closes an open controls panel; otherwise it is sent to the Mac, including in fullscreen. These local shortcuts use the physical Ctrl and Alt keys even with `--swap-ctrl-cmd`.
+
+While the panel is open, keyboard and mouse input stays local. Close it to resume controlling the Mac. Settings persist across reconnects during this run. Restart works even with `--no-reconnect`; Disconnect closes the viewer. Changing resolution explicitly also resizes the remote display with `--no-auto-resize`.
+
 ## Performance & Troubleshooting
 
 ### Hardware Decoding
