@@ -326,6 +326,10 @@ impl Session {
         &self.shared.frames
     }
 
+    pub fn decoder(&self) -> &'static str {
+        self.shared.metrics.decoder()
+    }
+
     fn control(&self) -> Option<&Arc<Control>> {
         self.shared.control.get()
     }

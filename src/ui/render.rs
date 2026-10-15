@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use winit::window::Window;
 
 use crate::video::decoder::{Layout, Picture, PlaneRef};
+use crate::session::OperatingPoint;
+use super::controls::{Actions, Controls};
 
 const SHADER: &str = r#"
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -90,6 +92,7 @@ pub struct Viewport {
 }
 
 pub struct Renderer {
+    pub controls: Controls,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -108,7 +111,7 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(instance: &wgpu::Instance, window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
-        let surface = instance.create_surface(window).context("creating surface")?;
+        let surface = instance.create_surface(window.clone()).context("creating surface")?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -218,7 +221,9 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let controls = Controls::new(&window, &device, view_format);
         Ok(Self {
+            controls,
             surface,
             device,
             queue,
@@ -368,14 +373,34 @@ impl Renderer {
         Some(Viewport { x: ((ww - w) / 2.0).floor(), y: ((wh - h) / 2.0).floor(), w, h })
     }
 
-    pub fn render(&mut self) {
+    pub fn render(&mut self, window: &Window, op: OperatingPoint, status: &str, decoder: &str, half_supported: bool) -> Actions {
+        let (mut out, actions) = self.controls.ui(window, op, status, decoder, half_supported);
+        let jobs = self.controls.ctx.tessellate(out.shapes, out.pixels_per_point);
+        for (id, deltas) in out.textures_delta.set.drain() {
+            for delta in deltas {
+                self.controls.gpu.update_texture(&self.device, &self.queue, id, &delta);
+            }
+        }
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: out.pixels_per_point,
+        };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                window.request_redraw();
+                for id in out.textures_delta.free.drain() {
+                    self.controls.gpu.free_texture(&id);
+                }
+                return actions;
             }
-            _ => return,
+            _ => {
+                for id in out.textures_delta.free.drain() {
+                    self.controls.gpu.free_texture(&id);
+                }
+                return actions;
+            },
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.view_format),
@@ -402,7 +427,23 @@ impl Renderer {
                     pass.draw(0..3, 0..1);
                 }
         }
-        self.queue.submit([enc.finish()]);
+        let extra = self.controls.gpu.update_buffers(&self.device, &self.queue, &mut enc, &jobs, &screen);
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("session controls"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            }).forget_lifetime();
+            self.controls.gpu.render(&mut pass, &jobs, &screen);
+        }
+        self.queue.submit(extra.into_iter().chain([enc.finish()]));
         self.queue.present(frame);
+        for id in out.textures_delta.free.drain() {
+            self.controls.gpu.free_texture(&id);
+        }
+        actions
     }
 }
