@@ -32,3 +32,12 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets
         if: matrix.toolchain == 'stable'
+
+  nix:
+    name: nix build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: DeterminateSystems/nix-installer-action@v17
+      - uses: DeterminateSystems/magic-nix-cache-action@v13
+      - run: nix build
