@@ -50,12 +50,16 @@
             postInstall = ''
               install -Dm644 assets/pippin.desktop -t $out/share/applications
               install -Dm644 assets/pippin.svg -t $out/share/icons/hicolor/scalable/apps
+              # Optional audio: pippin dlopens libfdk-aac.so; it's unfree in nixpkgs,
+              # so it's left out by default. To enable audio, uncomment and set
+              # NIXPKGS_ALLOW_UNFREE=1 (or allowUnfree = true in your config).
               wrapProgram $out/bin/pippin \
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath (with pkgs; [
                   vulkan-loader
                   libGL
                   wayland
                   libxkbcommon
+                  # libfdk-aac
                 ])}
             '';
 
@@ -101,6 +105,7 @@
                 libGL
                 wayland
                 libxkbcommon
+                # libfdk-aac # unfree; enables audio (see package comment above)
               ]
             );
           };
