@@ -56,6 +56,11 @@ impl Controls {
     }
 
     pub fn event(&mut self, window: &Window, event: &WindowEvent) -> bool {
+        // Closed controls must not also act on keys destined for the Mac.
+        // In particular, Tab followed by Enter must not activate Controls.
+        if !self.open && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)) {
+            return false;
+        }
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 let pixels_per_point = egui_winit::pixels_per_point(&self.ctx, window);
@@ -169,6 +174,13 @@ impl Controls {
                     });
             }
         });
+        if !self.open {
+            ctx.memory_mut(|memory| {
+                if let Some(id) = memory.focused() {
+                    memory.surrender_focus(id);
+                }
+            });
+        }
         let delay = out
             .viewport_output
             .get(&egui::ViewportId::ROOT)

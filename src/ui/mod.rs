@@ -418,6 +418,11 @@ impl ApplicationHandler<Tagged> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Keep the position current even while local controls consume movement,
+        // so a click immediately after Escape lands under the visible pointer.
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            self.cursor_pos = Some(*position);
+        }
         if let WindowEvent::KeyboardInput { event: ref key, is_synthetic: false, .. } = event {
             let open = self.renderer.as_ref().is_some_and(|r| r.controls.open);
             if let PhysicalKey::Code(code) = key.physical_key
@@ -506,8 +511,7 @@ impl ApplicationHandler<Tagged> for App {
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some(position);
+            WindowEvent::CursorMoved { .. } => {
                 self.send_pointer(self.buttons);
             }
             WindowEvent::MouseInput { state, button, .. } => {
