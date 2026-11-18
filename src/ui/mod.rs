@@ -129,7 +129,7 @@ impl App {
         }
     }
 
-    fn apply_controls(&mut self, el: &ActiveEventLoop, actions: controls::Actions) {
+    fn apply_controls(&mut self, actions: controls::Actions) {
         if actions.fullscreen {
             self.toggle_fullscreen();
         }
@@ -137,13 +137,7 @@ impl App {
             self.cfg.op.lock().render_scale = scale;
             self.send_resize();
         }
-        if let Some(after_loss) = actions.after_loss {
-            self.cfg.op.lock().after_loss = after_loss;
-        }
-        if actions.disconnect {
-            self.release_all();
-            el.exit();
-        } else if actions.restart {
+        if actions.restart {
             self.release_all();
             if let Some(s) = self.session.take() {
                 s.shutdown();
@@ -165,13 +159,18 @@ impl App {
         }
     }
 
+    fn backing_scale(&self, scale_factor: f64) -> f64 {
+        self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 })
+    }
+
     fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
-        let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
-        // Same logical size, fewer backing pixels: the Mac lays out as usual
-        // and we scale up its smaller picture.
+        let scale = self.backing_scale(scale_factor);
+        // Fewer backing pixels, and we scale up the Mac's smaller picture. At
+        // 2× the Mac keeps its layout and renders at 1×. macOS doesn't render
+        // below 1×, so at 1× it gets a smaller desktop instead.
         let r = self.cfg.op.lock().render_scale;
         let px = |v: u32| (v as f64 * r).round() as u32;
-        DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
+        DisplayRequest::for_pixels(px(size.width), px(size.height), (scale * r).max(1.0))
     }
 
     fn send_resize(&mut self) {
@@ -418,47 +417,37 @@ impl ApplicationHandler<Tagged> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Keep the position current even while local controls consume movement,
-        // so a click immediately after Escape lands under the visible pointer.
+        // Keep the position current even while the toolbar consumes movement,
+        // so a click right after leaving it lands under the visible pointer.
         if let WindowEvent::CursorMoved { position, .. } = &event {
             self.cursor_pos = Some(*position);
         }
-        if let WindowEvent::KeyboardInput { event: ref key, is_synthetic: false, .. } = event {
-            let open = self.renderer.as_ref().is_some_and(|r| r.controls.open);
-            if let PhysicalKey::Code(code) = key.physical_key
-                && let Some(shortcut) = controls::shortcut(code, self.modifiers, open)
-                && key.state == ElementState::Pressed
-            {
-                if !key.repeat {
-                    self.release_all();
-                    match shortcut {
-                        controls::Shortcut::Fullscreen => self.toggle_fullscreen(),
-                        controls::Shortcut::Menu => {
-                            if let Some(r) = &mut self.renderer {
-                                r.controls.open = !r.controls.open;
-                            }
-                        }
-                        controls::Shortcut::Close => {
-                            if let Some(r) = &mut self.renderer {
-                                r.controls.open = false;
-                            }
+        if let WindowEvent::KeyboardInput { event: ref key, is_synthetic: false, .. } = event
+            && let PhysicalKey::Code(code) = key.physical_key
+            && let Some(shortcut) = controls::shortcut(code, self.modifiers)
+            && key.state == ElementState::Pressed
+        {
+            if !key.repeat {
+                self.release_all();
+                match shortcut {
+                    controls::Shortcut::Fullscreen => self.toggle_fullscreen(),
+                    controls::Shortcut::Toolbar => {
+                        if let Some(r) = &mut self.renderer {
+                            r.controls.visible = !r.controls.visible;
                         }
                     }
-                    self.sync_cursor(el);
-                    if let Some(w) = &self.window { w.request_redraw(); }
                 }
-                return;
+                self.sync_cursor(el);
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
+            return;
         }
         let consumed = match (&mut self.renderer, &self.window) {
-            (Some(r), Some(w)) => r.controls.event(w, &event),
+            (Some(r), Some(w)) => r.controls.event(w, &event, self.buttons != 0),
             _ => false,
         };
         self.sync_cursor(el);
         if consumed {
-            // A drag or shortcut started on the remote desktop must not
-            // leave buttons or modifiers held when entering local UI.
-            self.release_all();
             return;
         }
         match event {
@@ -491,19 +480,19 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                let scale = self.opts.scale.unwrap_or_else(|| {
-                    if self.window.as_ref().is_some_and(|w| w.scale_factor() >= 1.5) { 2.0 } else { 1.0 }
-                });
-                let op = *self.cfg.op.lock();
                 let decoder = self.session.as_ref().map_or("", Session::decoder);
-                let decoder = if decoder.is_empty() { "Waiting for video" } else { decoder };
+                let retina = self.window.as_ref().is_some_and(|w| self.backing_scale(w.scale_factor()) >= 2.0);
                 if let (Some(r), Some(w)) = (&mut self.renderer, &self.window) {
-                    let was_open = r.controls.open;
-                    let actions = r.render(w, op, &self.status, decoder, scale == 2.0);
-                    if !was_open && r.controls.open {
-                        self.release_all();
-                    }
-                    self.apply_controls(el, actions);
+                    let view = controls::View {
+                        status: &self.status,
+                        connected: self.status == "Connected",
+                        decoder: if decoder.is_empty() { "waiting for video" } else { decoder },
+                        half: self.cfg.op.lock().render_scale < 1.0,
+                        retina,
+                        fullscreen: w.fullscreen().is_some(),
+                    };
+                    let actions = r.render(w, view);
+                    self.apply_controls(actions);
                     self.sync_cursor(el);
                     self.ui_due = self.renderer.as_ref().and_then(|r| r.controls.repaint_at);
                 }

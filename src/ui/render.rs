@@ -8,8 +8,7 @@ use anyhow::{Context, Result};
 use winit::window::Window;
 
 use crate::video::decoder::{Layout, Picture, PlaneRef};
-use crate::session::OperatingPoint;
-use super::controls::{Actions, Controls};
+use super::controls::{Actions, Controls, View};
 
 const SHADER: &str = r#"
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -373,8 +372,8 @@ impl Renderer {
         Some(Viewport { x: ((ww - w) / 2.0).floor(), y: ((wh - h) / 2.0).floor(), w, h })
     }
 
-    pub fn render(&mut self, window: &Window, op: OperatingPoint, status: &str, decoder: &str, half_supported: bool) -> Actions {
-        let (mut out, actions) = self.controls.ui(window, op, status, decoder, half_supported);
+    pub fn render(&mut self, window: &Window, view: View) -> Actions {
+        let (mut out, actions) = self.controls.ui(window, view);
         let jobs = self.controls.ctx.tessellate(out.shapes, out.pixels_per_point);
         for (id, deltas) in out.textures_delta.set.drain() {
             for delta in deltas {
