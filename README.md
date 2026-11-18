@@ -38,6 +38,20 @@ cd pippin/packaging/aur/pippin-git
 makepkg -si
 ```
 
+### Nix
+A flake is provided for Nix users. Run it directly, or enter a development shell:
+
+```sh
+# Run without installing
+nix run github:jonesy827/pippin -- my-mac.local -u alice
+
+# Build and install into your profile
+nix profile install github:jonesy827/pippin
+
+# Development shell (Rust toolchain, clang, FFmpeg headers, etc.)
+nix develop
+```
+
 ### Cargo (All Other Distros)
 Building from source requires **Rust 1.95 or newer** (use [rustup](https://rustup.rs) if your distro's package is older), along with `clang`, `pkg-config`, FFmpeg development headers, and ALSA:
 
