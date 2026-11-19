@@ -213,14 +213,14 @@ impl Dialog {
         let raw = gpu.state.take_egui_input(&gpu.window);
         let ctx = self.ctx.clone();
         let mut action = None;
-        let out = ctx.run_ui(raw, |ui| action = action.or(self.ui(ui)));
+        let mut out = ctx.run_ui(raw, |ui| action = action.or(self.ui(ui)));
         gpu.state.handle_platform_output(&gpu.window, out.platform_output);
         let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
         self.repaint_at = delay.filter(|d| *d < Duration::from_secs(3600)).map(|d| Instant::now() + d);
         let jobs = ctx.tessellate(out.shapes, out.pixels_per_point);
-        for (id, deltas) in &out.textures_delta.set {
+        for (id, deltas) in out.textures_delta.set.drain() {
             for delta in deltas {
-                gpu.egui.update_texture(&gpu.device, &gpu.queue, *id, delta);
+                gpu.egui.update_texture(&gpu.device, &gpu.queue, id, &delta);
             }
         }
         let screen = egui_wgpu::ScreenDescriptor {
@@ -262,8 +262,8 @@ impl Dialog {
             }
             _ => {}
         }
-        for id in &out.textures_delta.free {
-            gpu.egui.free_texture(id);
+        for id in out.textures_delta.free.drain() {
+            gpu.egui.free_texture(&id);
         }
         self.gpu = Some(gpu);
         match action {

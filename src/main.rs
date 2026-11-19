@@ -72,8 +72,9 @@ struct Cli {
     /// Fraction of the window's pixels the Mac renders and streams; the
     /// picture is scaled up locally. 0.5 on a Retina screen streams a quarter
     /// of the pixels: less bandwidth and smaller keyframes for slow links, at
-    /// the cost of softer text. The Mac's layout is unchanged. macOS only
-    /// renders whole scales, so 0.5 needs a Retina (2x) window.
+    /// the cost of softer text. The Mac's layout is unchanged. macOS doesn't
+    /// render below 1x, so on a 1x window the Mac gets a smaller desktop,
+    /// which appears twice as large.
     #[arg(long, default_value_t = 1.0)]
     render_scale: f64,
     /// Hold frames with missing packets for NACK retransmissions. auto stops
