@@ -60,6 +60,8 @@ pub(super) struct Controls {
     bar_size: egui::Vec2,
     expanded_until: Instant,
     dragging: bool,
+    /// The info card was pinned open by clicking ⓘ.
+    info_open: bool,
     /// A remote button is held: the pointer stays with the Mac until it is
     /// released, even when it crosses the toolbar.
     remote_busy: bool,
@@ -71,7 +73,11 @@ pub(super) struct Controls {
 impl Controls {
     pub fn new(window: &Arc<Window>, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let ctx = egui::Context::default();
-        ctx.all_styles_mut(|s| s.interaction.tooltip_delay = 0.25);
+        ctx.all_styles_mut(|s| {
+            s.interaction.tooltip_delay = 0.25;
+            // A resting hand on a mouse or trackpad is rarely perfectly still.
+            s.interaction.show_tooltips_only_when_still = false;
+        });
         let state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -92,6 +98,7 @@ impl Controls {
             bar_size: vec2(150.0, BUTTON + 8.0),
             expanded_until: Instant::now() + INTRO,
             dragging: false,
+            info_open: false,
             remote_busy: false,
             pointer: None,
             #[cfg(test)]
@@ -109,8 +116,13 @@ impl Controls {
     /// toolbar's and must not reach the Mac. `remote_busy`: a mouse button
     /// is held on the remote desktop.
     pub fn event(&mut self, window: &Window, event: &WindowEvent, remote_busy: bool) -> bool {
-        // Keys always go to the Mac, so egui never sees them.
-        if matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)) {
+        // Keys always go to the Mac, so egui never sees them. Nor does it see
+        // redraws: it answers each one with "repaint", which would request
+        // the next redraw and spin the event loop at full speed.
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_) | WindowEvent::RedrawRequested
+        ) {
             return false;
         }
         match event {
@@ -147,11 +159,17 @@ impl Controls {
             if !self.visible {
                 self.rect = Rect::NOTHING;
                 self.dragging = false;
+                self.info_open = false;
                 return;
             }
             let screen = ctx.content_rect();
             let hover = ctx.input(|i| i.pointer.hover_pos());
-            if self.dragging || (!self.remote_busy && hover.is_some_and(|p| self.rect.expand(4.0).contains(p))) {
+            let over = !self.remote_busy && hover.is_some_and(|p| self.rect.expand(4.0).contains(p));
+            // A click anywhere else, including on the Mac, closes the card.
+            if self.info_open && !over && ctx.input(|i| i.pointer.any_pressed()) {
+                self.info_open = false;
+            }
+            if self.dragging || self.info_open || over {
                 self.expanded_until = self.expanded_until.max(now + LINGER);
             }
             let expanded = now < self.expanded_until;
@@ -264,8 +282,24 @@ impl Controls {
                     }
 
                     let info_color = (!view.connected).then_some(Color32::from_rgb(0xe0, 0xa0, 0x30));
-                    self.button(ui, "info", false, "", |p, r, c| info(p, r, info_color.unwrap_or(c)))
-                        .on_hover_ui(|ui| info_tip(ui, view));
+                    let open = self.info_open;
+                    let r = self.button(ui, "info", open, "", |p, r, c| info(p, r, info_color.unwrap_or(c)));
+                    if r.clicked() {
+                        self.info_open = !open;
+                    }
+                    if self.info_open {
+                        // Pinned: shown below the button until closed.
+                        egui::Area::new(Id::new("toolbar-info"))
+                            .order(egui::Order::Tooltip)
+                            .pivot(Align2::RIGHT_TOP)
+                            .fixed_pos(r.rect.right_bottom() + vec2(4.0, 8.0))
+                            .interactable(false)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| info_tip(ui, view));
+                            });
+                    } else {
+                        r.on_hover_ui(|ui| info_tip(ui, view));
+                    }
                 });
             });
     }
@@ -519,6 +553,12 @@ mod display_tests {
                 let half = r.controls.buttons["half"].center();
                 let a = click(&mut r, w, half);
                 assert_eq!(a.render_scale, Some(0.5));
+                // Clicking ⓘ pins the info card; a click on the Mac closes it.
+                let info = r.controls.buttons["info"].center();
+                click(&mut r, w, info);
+                assert!(r.controls.info_open, "clicking info should pin the card");
+                click(&mut r, w, pos2(800.0, 500.0));
+                assert!(!r.controls.info_open, "a click elsewhere should close the card");
                 // Hidden with Ctrl+Alt+M: nothing is local.
                 r.controls.visible = false;
                 r.render(w, view(true));
