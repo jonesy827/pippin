@@ -87,7 +87,10 @@ struct App {
     /// Error that ended the session, reported after the window closes.
     error: Option<String>,
 
+    /// The display the host was last asked for.
     last_request: Option<DisplayRequest>,
+    /// A resize came in while connecting; send it once connected.
+    resize_pending: bool,
     resize_due: Option<Instant>,
 
     cursor_pos: Option<PhysicalPosition<f64>>,
@@ -120,12 +123,16 @@ impl App {
         }
         self.local_cursor = local;
         if local {
-            if let Some(w) = &self.window {
-                w.set_cursor_visible(true);
-                w.set_cursor(CursorIcon::Default);
+            if let (Some(r), Some(w)) = (&mut self.renderer, &self.window) {
+                r.controls.reset_cursor(w);
             }
         } else if let Some(c) = self.remote_cursor.clone() {
             self.set_cursor(el, c);
+        } else if let Some(w) = &self.window {
+            // No remote shape yet (still connecting): don't keep the
+            // toolbar's grab hand over the Mac.
+            w.set_cursor_visible(true);
+            w.set_cursor(CursorIcon::Default);
         }
     }
 
@@ -154,7 +161,9 @@ impl App {
             if let Some(r) = &mut self.renderer {
                 r.set_dimmed(true);
             }
-            // Explicit restart works even with --no-reconnect.
+            // Explicit restart works even with --no-reconnect, and a failed
+            // restart is handled like a dropped session.
+            self.reconnector.restarting();
             self.start_session();
         }
     }
@@ -177,8 +186,11 @@ impl App {
         let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
         let req = self.display_request(w.inner_size(), w.scale_factor());
         if self.last_request != Some(req) {
-            self.last_request = Some(req);
-            s.resize(req);
+            if s.resize(req) {
+                self.last_request = Some(req);
+            } else {
+                self.resize_pending = true;
+            }
         }
     }
 
@@ -285,6 +297,7 @@ impl App {
         let Some(w) = &self.window else { return };
         let req = self.display_request(w.inner_size(), w.scale_factor());
         self.last_request = Some(req);
+        self.resize_pending = false;
         // Process-wide, so events left queued by a previous viewer run on
         // the shared event loop can't match a new session.
         self.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -382,8 +395,9 @@ impl ApplicationHandler<Tagged> for App {
                 if let Some(w) = &self.window {
                     w.set_title(&self.opts.title);
                 }
-                // The window may have been resized while connecting.
-                if self.opts.auto_resize {
+                // The window may have been resized, or the resolution
+                // changed, while connecting.
+                if self.opts.auto_resize || std::mem::take(&mut self.resize_pending) {
                     self.send_resize();
                 }
             }
@@ -585,6 +599,7 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         retry_due: None,
         error: None,
         last_request: None,
+        resize_pending: false,
         resize_due: None,
         cursor_pos: None,
         buttons: 0,

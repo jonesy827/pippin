@@ -75,6 +75,13 @@ impl Reconnector {
         self.reconnecting = false;
     }
 
+    /// The user restarted the session. Once connected before, the new
+    /// session counts as a reconnect, so a failure retries instead of
+    /// quitting (if reconnecting is enabled).
+    pub fn restarting(&mut self) {
+        self.reconnecting = self.connected_once;
+    }
+
     /// A picture arrived: the session really works, so the next drop
     /// starts again from the first delay.
     pub fn video(&mut self) {
@@ -126,6 +133,17 @@ mod tests {
         let mut r = Reconnector::new(true);
         assert_eq!(r.ended(true), OnEnd::Exit);
         assert!(!r.reconnecting());
+    }
+
+    #[test]
+    fn restart_counts_as_reconnect_only_after_connecting() {
+        let mut r = Reconnector::new(true);
+        r.restarting();
+        assert!(!r.reconnecting());
+        r.connected();
+        r.restarting();
+        assert!(r.reconnecting());
+        assert_eq!(r.ended(true), secs(1));
     }
 
     #[test]

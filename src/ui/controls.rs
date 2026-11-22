@@ -24,6 +24,9 @@ const EDGE: f32 = 8.0;
 const BUTTON: f32 = 28.0;
 /// Hit area of the resting handle.
 const HANDLE: egui::Vec2 = vec2(56.0, 16.0);
+/// Pointer movement within this distance of the toolbar redraws it; farther
+/// away it can't change anything, so the Mac's pointer costs no frames.
+const NEAR: f32 = 24.0;
 
 #[derive(Default)]
 pub(super) struct Actions {
@@ -112,6 +115,17 @@ impl Controls {
             && (self.dragging || (!self.remote_busy && self.pointer.is_some_and(|p| self.rect.contains(p))))
     }
 
+    fn near(&self, p: Option<Pos2>) -> bool {
+        p.is_some_and(|p| self.rect.expand(NEAR).contains(p))
+    }
+
+    /// The pointer moved onto the toolbar: make the window's cursor and
+    /// egui-winit's record of it agree, so egui's next icon is applied.
+    pub fn reset_cursor(&mut self, window: &Window) {
+        let output = egui::PlatformOutput { cursor_icon: egui::CursorIcon::Default, ..Default::default() };
+        self.state.handle_platform_output(window, output);
+    }
+
     /// Feeds a window event to the toolbar. Returns true if it was the
     /// toolbar's and must not reach the Mac. `remote_busy`: a mouse button
     /// is held on the remote desktop.
@@ -125,6 +139,7 @@ impl Controls {
         ) {
             return false;
         }
+        let was = self.pointer;
         match event {
             WindowEvent::CursorMoved { position, .. } => {
                 let pixels_per_point = egui_winit::pixels_per_point(&self.ctx, window);
@@ -141,13 +156,26 @@ impl Controls {
         self.remote_busy = remote_busy && !self.dragging;
         let local = self.local_pointer();
         let response = self.state.on_window_event(window, event);
-        if response.repaint || (self.visible && matches!(event, WindowEvent::CursorMoved { .. })) {
+        let pointer = matches!(
+            event,
+            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+        );
+        // egui wants a repaint for every pointer event. Only honour that
+        // where the toolbar can react: near it, while dragging it, or on a
+        // press that closes the info card.
+        let redraw = if pointer {
+            self.visible
+                && (self.dragging
+                    || self.near(was)
+                    || self.near(self.pointer)
+                    || (self.info_open && matches!(event, WindowEvent::MouseInput { .. })))
+        } else {
+            response.repaint
+        };
+        if redraw {
             window.request_redraw();
         }
-        match event {
-            WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => local,
-            _ => false,
-        }
+        pointer && local
     }
 
     pub fn ui(&mut self, window: &Window, view: View) -> (egui::FullOutput, Actions) {
@@ -209,21 +237,24 @@ impl Controls {
                 memory.surrender_focus(id);
             }
         });
+        // Away from the toolbar egui's repaints are only for pointer motion
+        // it can't react to; the collapse timer covers any fade-out.
+        let near = self.visible && (self.dragging || self.info_open || self.near(self.pointer));
         let delay = out
             .viewport_output
             .get(&egui::ViewportId::ROOT)
-            .map(|v| v.repaint_delay);
+            .map(|v| v.repaint_delay)
+            .filter(|_| near);
         // Collapse on time, and keep the status tooltip fresh while expanded.
         let collapse = self
             .expanded_until
             .checked_duration_since(now)
             .filter(|_| self.visible)
             .map(|d| d.min(Duration::from_millis(250)));
-        let delay = match (delay, collapse) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        self.repaint_at = delay
+        self.repaint_at = [delay, collapse]
+            .into_iter()
+            .flatten()
+            .min()
             .filter(|d| *d < Duration::from_secs(3600))
             .map(|d| now + d);
         // The remote cursor owns the window outside the toolbar.

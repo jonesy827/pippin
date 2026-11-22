@@ -347,9 +347,11 @@ impl Session {
         }
     }
 
-    /// Asks the host to resize its virtual display.
-    pub fn resize(&self, req: DisplayRequest) {
-        if let Some(c) = self.control() {
+    /// Asks the host to resize its virtual display. Returns false, sending
+    /// nothing, while the session is still connecting.
+    pub fn resize(&self, req: DisplayRequest) -> bool {
+        let Some(c) = self.control() else { return false };
+        {
             tracing::info!(
                 "requesting {}x{} @{}x (backing {:?})",
                 req.width,
@@ -359,6 +361,7 @@ impl Session {
             );
             c.send(&messages::set_display_configuration(&req));
         }
+        true
     }
 
     /// Stops every session thread and waits for them, so the sockets are
