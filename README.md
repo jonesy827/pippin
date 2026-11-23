@@ -160,6 +160,10 @@ cargo test
 * **Live Control:** Set `PIPPIN_CONTROL_FIFO=/tmp/pippin.ctl` to adjust parameters on the fly (e.g., `echo 'render_scale 0.5' > /tmp/pippin.ctl`). Supported commands (`render_scale`, `after_loss`, `hold`, `recovery`, `ltr`, `fps`, `keyframe`, `restart`) are documented in `src/session/operating.rs`.
 * **AUR Packaging:** AUR package definitions live in `packaging/aur/`. After tagging a release, bump `pkgver` in `packaging/aur/pippin/PKGBUILD`, then run `updpkgsums` and `makepkg --printsrcinfo > .SRCINFO` before pushing to the AUR.
 
+## Contributing
+
+Bug reports and pull requests are welcome, including AI-assisted ones. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Credits & License
 
 `pippin` is an independent Rust implementation built on the protocol reverse-engineering work of [iShareScreen](https://github.com/renegadelink/iShareScreen). 
