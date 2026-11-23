@@ -197,6 +197,10 @@ impl Metrics {
         }
     }
 
+    pub fn decoder(&self) -> &'static str {
+        *self.decoder.lock()
+    }
+
     pub fn set_decoder(&self, name: &'static str) {
         *self.decoder.lock() = name;
     }

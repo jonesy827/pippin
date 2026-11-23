@@ -1,6 +1,7 @@
 //! The viewer window: renders the remote canvas, forwards input and keeps
 //! the host's virtual display sized to the window.
 
+mod controls;
 pub mod dialog;
 mod keymap;
 mod reconnect;
@@ -18,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
-use winit::window::{CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
+use winit::window::{Fullscreen, CursorIcon, CustomCursor, Window, WindowAttributes, WindowId};
 
 use crate::proto::messages::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SCROLL_DOWN, BTN_SCROLL_UP, DisplayRequest};
 use crate::session::{Config, CursorShape, Event, EventSink, Session};
@@ -86,7 +87,10 @@ struct App {
     /// Error that ended the session, reported after the window closes.
     error: Option<String>,
 
+    /// The display the host was last asked for.
     last_request: Option<DisplayRequest>,
+    /// A resize came in while connecting; send it once connected.
+    resize_pending: bool,
     resize_due: Option<Instant>,
 
     cursor_pos: Option<PhysicalPosition<f64>>,
@@ -97,24 +101,96 @@ struct App {
     /// even if modifiers changed in between.
     pressed: HashMap<KeyCode, u32>,
     cursors: HashMap<u32, CustomCursor>,
+    remote_cursor: Option<CursorShape>,
+    local_cursor: bool,
+    status: String,
+    ui_due: Option<Instant>,
 }
 
 impl App {
+    fn toggle_fullscreen(&mut self) {
+        self.release_all();
+        if let Some(w) = &self.window {
+            w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
+            w.request_redraw();
+        }
+    }
+
+    fn sync_cursor(&mut self, el: &ActiveEventLoop) {
+        let local = self.renderer.as_ref().is_some_and(|r| r.controls.local_pointer());
+        if local == self.local_cursor {
+            return;
+        }
+        self.local_cursor = local;
+        if local {
+            if let (Some(r), Some(w)) = (&mut self.renderer, &self.window) {
+                r.controls.reset_cursor(w);
+            }
+        } else if let Some(c) = self.remote_cursor.clone() {
+            self.set_cursor(el, c);
+        } else if let Some(w) = &self.window {
+            // No remote shape yet (still connecting): don't keep the
+            // toolbar's grab hand over the Mac.
+            w.set_cursor_visible(true);
+            w.set_cursor(CursorIcon::Default);
+        }
+    }
+
+    fn apply_controls(&mut self, actions: controls::Actions) {
+        if actions.fullscreen {
+            self.toggle_fullscreen();
+        }
+        if let Some(scale) = actions.render_scale {
+            self.cfg.op.lock().render_scale = scale;
+            self.send_resize();
+        }
+        if actions.restart {
+            self.release_all();
+            if let Some(s) = self.session.take() {
+                s.shutdown();
+            }
+            self.retry_due = None;
+            self.cursors.clear();
+            self.remote_cursor = None;
+            self.scroll_accum = 0.0;
+            self.status = "Connecting…".into();
+            if let Some(w) = &self.window {
+                w.set_title(&format!("{} — connecting…", self.opts.title));
+                w.request_redraw();
+            }
+            if let Some(r) = &mut self.renderer {
+                r.set_dimmed(true);
+            }
+            // Explicit restart works even with --no-reconnect, and a failed
+            // restart is handled like a dropped session.
+            self.reconnector.restarting();
+            self.start_session();
+        }
+    }
+
+    fn backing_scale(&self, scale_factor: f64) -> f64 {
+        self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 })
+    }
+
     fn display_request(&self, size: PhysicalSize<u32>, scale_factor: f64) -> DisplayRequest {
-        let scale = self.opts.scale.unwrap_or(if scale_factor >= 1.5 { 2.0 } else { 1.0 });
-        // Same logical size, fewer backing pixels: the Mac lays out as usual
-        // and we scale up its smaller picture.
+        let scale = self.backing_scale(scale_factor);
+        // Fewer backing pixels, and we scale up the Mac's smaller picture. At
+        // 2× the Mac keeps its layout and renders at 1×. macOS doesn't render
+        // below 1×, so at 1× it gets a smaller desktop instead.
         let r = self.cfg.op.lock().render_scale;
         let px = |v: u32| (v as f64 * r).round() as u32;
-        DisplayRequest::for_pixels(px(size.width), px(size.height), scale * r)
+        DisplayRequest::for_pixels(px(size.width), px(size.height), (scale * r).max(1.0))
     }
 
     fn send_resize(&mut self) {
         let (Some(w), Some(s)) = (&self.window, &self.session) else { return };
         let req = self.display_request(w.inner_size(), w.scale_factor());
         if self.last_request != Some(req) {
-            self.last_request = Some(req);
-            s.resize(req);
+            if s.resize(req) {
+                self.last_request = Some(req);
+            } else {
+                self.resize_pending = true;
+            }
         }
     }
 
@@ -221,6 +297,7 @@ impl App {
         let Some(w) = &self.window else { return };
         let req = self.display_request(w.inner_size(), w.scale_factor());
         self.last_request = Some(req);
+        self.resize_pending = false;
         // Process-wide, so events left queued by a previous viewer run on
         // the shared event loop can't match a new session.
         self.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -239,6 +316,7 @@ impl App {
             }
             OnEnd::Retry(d) => d,
         };
+        self.status = format!("Reconnecting: {reason}");
         tracing::warn!("{reason}; reconnecting in {} s", delay.as_secs());
         // Joins the old threads so their sockets and UDP ports are released
         // before the next session binds them.
@@ -252,6 +330,7 @@ impl App {
         self.buttons = 0;
         self.scroll_accum = 0.0;
         self.cursors.clear();
+        self.remote_cursor = None;
         if let Some(w) = &self.window {
             w.set_cursor_visible(true);
             w.set_cursor(CursorIcon::Default);
@@ -261,6 +340,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_dimmed(true);
         }
+        self.sync_cursor(el);
     }
 
     fn fail(&mut self, el: &ActiveEventLoop, msg: String) {
@@ -308,14 +388,16 @@ impl ApplicationHandler<Tagged> for App {
                     tracing::info!("reconnected");
                 }
                 self.reconnector.connected();
+                self.status = "Connected".into();
                 if let Some(r) = &mut self.renderer {
                     r.set_dimmed(false);
                 }
                 if let Some(w) = &self.window {
                     w.set_title(&self.opts.title);
                 }
-                // The window may have been resized while connecting.
-                if self.opts.auto_resize {
+                // The window may have been resized, or the resolution
+                // changed, while connecting.
+                if self.opts.auto_resize || std::mem::take(&mut self.resize_pending) {
                     self.send_resize();
                 }
             }
@@ -331,7 +413,12 @@ impl ApplicationHandler<Tagged> for App {
                     r.set_canvas(width, height);
                 }
             }
-            Event::Cursor(c) => self.set_cursor(el, c),
+            Event::Cursor(c) => {
+                self.remote_cursor = Some(c.clone());
+                if !self.local_cursor {
+                    self.set_cursor(el, c);
+                }
+            },
             Event::Closed(reason) => {
                 self.error = reason;
                 el.exit();
@@ -344,6 +431,39 @@ impl ApplicationHandler<Tagged> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Keep the position current even while the toolbar consumes movement,
+        // so a click right after leaving it lands under the visible pointer.
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            self.cursor_pos = Some(*position);
+        }
+        if let WindowEvent::KeyboardInput { event: ref key, is_synthetic: false, .. } = event
+            && let PhysicalKey::Code(code) = key.physical_key
+            && let Some(shortcut) = controls::shortcut(code, self.modifiers)
+            && key.state == ElementState::Pressed
+        {
+            if !key.repeat {
+                self.release_all();
+                match shortcut {
+                    controls::Shortcut::Fullscreen => self.toggle_fullscreen(),
+                    controls::Shortcut::Toolbar => {
+                        if let Some(r) = &mut self.renderer {
+                            r.controls.visible = !r.controls.visible;
+                        }
+                    }
+                }
+                self.sync_cursor(el);
+                if let Some(w) = &self.window { w.request_redraw(); }
+            }
+            return;
+        }
+        let consumed = match (&mut self.renderer, &self.window) {
+            (Some(r), Some(w)) => r.controls.event(w, &event, self.buttons != 0),
+            _ => false,
+        };
+        self.sync_cursor(el);
+        if consumed {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
@@ -374,15 +494,27 @@ impl ApplicationHandler<Tagged> for App {
                         tracing::trace!("uploaded {n} tiles in {:.2} ms", started.elapsed().as_secs_f64() * 1000.0);
                     }
                 }
-                if let Some(r) = &mut self.renderer {
-                    r.render();
+                let decoder = self.session.as_ref().map_or("", Session::decoder);
+                let retina = self.window.as_ref().is_some_and(|w| self.backing_scale(w.scale_factor()) >= 2.0);
+                if let (Some(r), Some(w)) = (&mut self.renderer, &self.window) {
+                    let view = controls::View {
+                        status: &self.status,
+                        connected: self.status == "Connected",
+                        decoder: if decoder.is_empty() { "waiting for video" } else { decoder },
+                        half: self.cfg.op.lock().render_scale < 1.0,
+                        retina,
+                        fullscreen: w.fullscreen().is_some(),
+                    };
+                    let actions = r.render(w, view);
+                    self.apply_controls(actions);
+                    self.sync_cursor(el);
+                    self.ui_due = self.renderer.as_ref().and_then(|r| r.controls.repaint_at);
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.key(&event),
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_pos = Some(position);
+            WindowEvent::CursorMoved { .. } => {
                 self.send_pointer(self.buttons);
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -420,22 +552,19 @@ impl ApplicationHandler<Tagged> for App {
                 tracing::info!("reconnecting");
                 self.start_session();
             }
-        let wake = match (self.resize_due, self.retry_due) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        match wake {
-            Some(due) if Instant::now() >= due => {
-                self.resize_due = None;
-                self.send_resize();
-                el.set_control_flow(match self.retry_due {
-                    Some(d) => ControlFlow::WaitUntil(d),
-                    None => ControlFlow::Wait,
-                });
-            }
-            Some(due) => el.set_control_flow(ControlFlow::WaitUntil(due)),
-            None => el.set_control_flow(ControlFlow::Wait),
+        if self.ui_due.is_some_and(|t| Instant::now() >= t) {
+            self.ui_due = None;
+            if let Some(w) = &self.window { w.request_redraw(); }
         }
+        if self.resize_due.is_some_and(|t| Instant::now() >= t) {
+            self.resize_due = None;
+            self.send_resize();
+        }
+        let wake = [self.resize_due, self.retry_due, self.ui_due].into_iter().flatten().min();
+        el.set_control_flow(match wake {
+            Some(due) => ControlFlow::WaitUntil(due),
+            None => ControlFlow::Wait,
+        });
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
@@ -470,6 +599,7 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         retry_due: None,
         error: None,
         last_request: None,
+        resize_pending: false,
         resize_due: None,
         cursor_pos: None,
         buttons: 0,
@@ -477,6 +607,10 @@ pub fn run(event_loop: &mut EventLoop<Tagged>, cfg: Config, opts: Options) -> Re
         modifiers: ModifiersState::empty(),
         pressed: HashMap::new(),
         cursors: HashMap::new(),
+        remote_cursor: None,
+        local_cursor: false,
+        status: "Connecting…".into(),
+        ui_due: None,
     };
     event_loop.run_app_on_demand(&mut app)?;
     if let Some(s) = app.session.take() {

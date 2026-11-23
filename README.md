@@ -99,12 +99,25 @@ When prompted interactively, `pippin` offers to save your password to the deskto
 | `--session share\|alt` | Share the active user's screen (default), or log into a separate background session. |
 | `--scale N` | Set display scale. Defaults to `2` on HiDPI screens, `1` otherwise. |
 | `--no-auto-resize` | Keep the Mac's display resolution fixed instead of resizing with the window. |
-| `--render-scale 0.5` | Stream at half resolution on a 2× display. Softens text slightly in exchange for a 75% bandwidth reduction. |
+| `--render-scale 0.5` | Stream at half resolution. Softens text slightly in exchange for a 75% bandwidth reduction; on a 1× display the Mac's desktop also appears twice as large. |
 | `--decoder <TYPE>` | Choose video decoder: `auto` (default), `cuda`, `vaapi`, or `software`. Use `--vaapi-device` to specify a render node. |
 | `--after-loss idr\|conceal` | On packet loss, freeze until the next keyframe (`idr`, default) or continue with visual artifacts (`conceal`). |
 | `--no-audio` | Mute audio and instruct the Mac not to stream sound. |
 | `--swap-ctrl-cmd` | Map `Ctrl` to `⌘`. By default, `Super` is `⌘` and `Alt` is `⌥`. |
 | `-v`, `-vv` | Enable debug or trace logging (passwords and clipboard contents are never logged). |
+
+## Session Toolbar
+
+A small handle rests at the top of the viewer. Point at it to expand the toolbar:
+
+* **½** streams at half resolution: a quarter of the pixels, so less bandwidth and softer text. On a 2× screen the Mac's layout is unchanged; on a 1× screen the Mac's desktop also appears twice as large.
+* **Fullscreen** toggles borderless fullscreen (also **Ctrl+Alt+Enter**).
+* **Restart** reconnects the session, even with `--no-reconnect`.
+* **ⓘ** shows the connection status, the active decoder and the shortcuts. It turns amber while connecting.
+
+Drag the toolbar, by its grip or anywhere on it, to move it out of the way; it keeps its place across resizes and fullscreen. **Ctrl+Alt+M** hides or shows it. These shortcuts use the physical Ctrl and Alt keys even with `--swap-ctrl-cmd`; every other key, including Esc, goes to the Mac.
+
+The toolbar never takes the keyboard, and it only takes the mouse while the pointer is over it. Resolution persists across reconnects during this run, and changing it also resizes the remote display with `--no-auto-resize`.
 
 ## Performance & Troubleshooting
 
